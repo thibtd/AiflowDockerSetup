@@ -1,0 +1,159 @@
+# Define common settings using YAML anchors
+x-airflow-common: &airflow-common
+  # Use the image built from our Dockerfile
+  build:
+    context: . # Use the current directory for build context
+    args:
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000} # Pass UID from .env, with default
+      AIRFLOW_GID: ${AIRFLOW_GID:-0} # Pass GID from .env, with default
+  image: local/my-airflow:latest # Tag the built image
+  env_file:
+    - .env # Load environment variables from .env file
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW_LOAD_EXAMPLES:-false}
+  volumes:
+    # Mount local directories into the container
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    # You might need other volumes depending on your setup, e.g., for requirements.txt
+    # - ./requirements.txt:/requirements.txt
+  # Run containers as the specified user/group to match host permissions
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+  depends_on:
+    # Ensure postgres is healthy before airflow services start
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13 # Use a specific Postgres version
+    container_name: airflow_postgres
+    env_file:
+      - .env # Use variables from .env
+    environment:
+      # These ensure Postgres uses the vars from .env
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    # Optional: Set the timezone for Postgres
+    volumes:
+      # Persist Postgres data using a named volume
+      - airflow-postgres-data:/var/lib/postgresql/data
+    ports:
+      # Optional: Expose Postgres port to host for debugging/direct access
+      - "5433:5432" # Map container 5432 to host 5433 to avoid conflicts
+    healthcheck:
+      # Check if Postgres is ready to accept connections
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:latest
+    container_name: airflow_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-webserver:
+    <<: *airflow-common # Inherit common settings
+    container_name: airflow_webserver
+    command: webserver # Command to run Airflow webserver
+    ports:
+      # Map Airflow UI port 8080 to host's 8080
+      - "8080:8080"
+    healthcheck:
+      # Check if the webserver is responsive
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"] # Corrected flag syntax
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common # Inherit common settings
+    container_name: airflow_scheduler
+    command: scheduler # Command to run Airflow scheduler
+    # Ensure webserver is also healthy, helps avoid race conditions during startup
+    # although not strictly required by the scheduler itself
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow_worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || exit 1'
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_started
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow_triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # This service runs once to initialize the database and create the admin user
+  airflow-init:
+    <<: *airflow-common # Inherit common settings
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    # Runs db init and creates the default user specified in .env
+    command:
+      - -c
+      - |
+        echo "Waiting for DB…" && \
+        airflow db check --retry 6 --retry-delay 5 && \
+        echo "DB ready! Initializing DB…" && \
+        airflow db migrate && \
+        echo "Creating Airflow admin user…" && \
+          airflow users create \
+            --username ${_AIRFLOW_WWW_USER_USERNAME:-admin} \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email admin@example.com \
+            --password ${_AIRFLOW_WWW_USER_PASSWORD:-admin} && \
+        echo "Initialization complete."
+
+volumes:
+  airflow-postgres-data:
